@@ -11,8 +11,8 @@ from typing import IO, Any
 
 @lru_cache(maxsize=1)
 def is_noninteractive_console() -> bool:
-    """Check for known non-interactive console environments."""
-    return "GITHUB_ACTIONS" in os.environ or "RUNPOD_POD_ID" in os.environ
+    """Check for known non-interactive console environments (e.g. CI, RunPod, SLURM detached jobs)."""
+    return "GITHUB_ACTIONS" in os.environ or "RUNPOD_POD_ID" in os.environ or not sys.stdout.isatty()
 
 
 class TQDM:
