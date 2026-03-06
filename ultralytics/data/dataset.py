@@ -639,6 +639,208 @@ class GroundingDataset(YOLODataset):
         return [k for k, v in category_freq.items() if v >= threshold]
 
 
+class YOLODatasetCOCO(YOLODataset):
+    """Dataset class for loading object detection/segmentation labels from a COCO-format JSON annotation file.
+
+    Instead of per-image .txt label files, this class reads a single COCO JSON file per data split,
+    which is more efficient for large datasets. The JSON must follow the standard COCO format with
+    'images', 'annotations', and 'categories' keys.
+
+    Attributes:
+        ann_file (str): Path to the COCO JSON annotation file for this split.
+
+    Methods:
+        get_img_files: Return empty list as image files are discovered from the JSON in get_labels.
+        cache_labels: Load, process, and cache labels from the COCO JSON file.
+        get_labels: Return label list from cache or by parsing the COCO JSON file.
+
+    Examples:
+        >>> dataset = YOLODatasetCOCO(
+        ...     img_path="path/to/images",
+        ...     ann_file="path/to/annotations.coco.json",
+        ...     data={"names": {0: "cat", 1: "dog"}},
+        ...     task="detect",
+        ... )
+    """
+
+    def __init__(self, *args, ann_file: str = "", data: dict | None = None, task: str = "detect", **kwargs):
+        """Initialize a YOLODatasetCOCO instance.
+
+        Args:
+            ann_file (str): Path to the COCO JSON annotation file.
+            data (dict, optional): Dataset configuration dictionary (must include 'names').
+            task (str): Task type, one of 'detect' or 'segment'.
+            *args (Any): Additional positional arguments for the parent class.
+            **kwargs (Any): Additional keyword arguments for the parent class.
+        """
+        assert task in {"detect", "segment"}, "YOLODatasetCOCO only supports 'detect' and 'segment' tasks."
+        assert ann_file, "An annotation file path must be provided via 'ann_file'."
+        self.ann_file = ann_file
+        super().__init__(*args, data=data, task=task, **kwargs)
+
+    def get_img_files(self, img_path: str) -> list:
+        """Image files are discovered from the COCO JSON in get_labels; return empty list here.
+
+        Args:
+            img_path (str): Path to the image directory (stored for later use).
+
+        Returns:
+            (list): Empty list.
+        """
+        return []
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
+        """Load and cache annotations from a COCO JSON annotation file.
+
+        Reads the COCO JSON, maps category IDs to dataset class indices by name matching,
+        and converts pixel-space COCO bboxes to normalized xywh format.
+
+        Args:
+            path (Path): Path where to save the *.cache file.
+
+        Returns:
+            (dict): Dictionary containing cached labels and scan statistics.
+        """
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # missing, found, empty, corrupt, messages
+
+        LOGGER.info(f"{self.prefix}Loading annotations from {self.ann_file}...")
+        with open(self.ann_file) as f:
+            coco_data = json.load(f)
+
+        # Build COCO category_id -> 0-based class index mapping using dataset class names.
+        # data["names"] is a dict {0: "class0", 1: "class1", ...} after YAML loading.
+        name_to_idx: dict[str, int] = {v.lower(): k for k, v in self.data["names"].items()}
+        cat_id_to_cls: dict[int, int] = {}
+        for cat in coco_data.get("categories", []):
+            cat_name = cat["name"].lower()
+            if cat_name in name_to_idx:
+                cat_id_to_cls[cat["id"]] = name_to_idx[cat_name]
+            else:
+                msgs.append(f"{self.prefix}COCO category '{cat['name']}' not found in dataset class names, skipping.")
+
+        if not cat_id_to_cls:
+            raise ValueError(
+                f"No COCO categories could be matched to dataset class names. "
+                f"Ensure category names in '{self.ann_file}' match those defined in the data config."
+            )
+
+        # Build image id -> image info dict and group annotations by image id
+        images = {img["id"]: img for img in coco_data["images"]}
+        img_to_anns: dict = defaultdict(list)
+        for ann in coco_data["annotations"]:
+            img_to_anns[ann["image_id"]].append(ann)
+
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        for img_id, img_info in TQDM(images.items(), desc=desc):
+            h, w = img_info["height"], img_info["width"]
+            im_file = Path(self.img_path) / img_info["file_name"]
+
+            if not im_file.exists():
+                nm += 1
+                continue
+
+            self.im_files.append(str(im_file))
+            bboxes = []
+            segs = []
+
+            for ann in img_to_anns.get(img_id, []):
+                if ann.get("iscrowd", 0):
+                    continue
+                cat_id = ann["category_id"]
+                if cat_id not in cat_id_to_cls:
+                    continue
+                cls_idx = cat_id_to_cls[cat_id]
+
+                # COCO bbox format: [x_min, y_min, width, height] in pixels.
+                # Convert to normalized center-format xywh.
+                bx, by, bw, bh = ann["bbox"]
+                if bw <= 0 or bh <= 0:
+                    continue
+                bboxes.append([cls_idx, (bx + bw / 2) / w, (by + bh / 2) / h, bw / w, bh / h])
+
+                # Optionally load segmentation polygons for segment task
+                if self.use_segments and ann.get("segmentation"):
+                    seg = ann["segmentation"]
+                    if isinstance(seg, list) and len(seg) > 0:
+                        if len(seg) > 1:
+                            s = merge_multi_segment(seg)
+                            s = (
+                                np.concatenate(s, axis=0) / np.array([w, h], dtype=np.float32)
+                            ).reshape(-1).tolist()
+                        else:
+                            s = (
+                                np.array(seg[0], dtype=np.float32).reshape(-1, 2)
+                                / np.array([w, h], dtype=np.float32)
+                            ).reshape(-1).tolist()
+                        segs.append([cls_idx, *s])
+
+            lb = np.array(bboxes, dtype=np.float32) if bboxes else np.zeros((0, 5), dtype=np.float32)
+            segments_out: list = []
+
+            if segs and self.use_segments:
+                cls_arr = np.array([s[0] for s in segs], dtype=np.float32)
+                segments_out = [np.array(s[1:], dtype=np.float32).reshape(-1, 2) for s in segs]
+                lb = np.concatenate((cls_arr.reshape(-1, 1), segments2boxes(segments_out)), axis=1)
+
+            if len(lb):
+                nf += 1
+            else:
+                ne += 1
+
+            x["labels"].append(
+                {
+                    "im_file": str(im_file),
+                    "shape": (h, w),
+                    "cls": lb[:, 0:1],  # n, 1
+                    "bboxes": lb[:, 1:],  # n, 4
+                    "segments": segments_out,
+                    "keypoints": None,
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {self.ann_file}. {HELP_URL}")
+
+        x["hash"] = get_hash([self.ann_file])
+        x["results"] = nf, nm, ne, nc, len(images)  # total = all images declared in JSON
+        x["msgs"] = msgs
+        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self) -> list[dict]:
+        """Load labels from cache or parse the COCO JSON annotation file.
+
+        Returns:
+            (list[dict]): List of label dictionaries, each containing per-image annotation data.
+        """
+        cache_path = Path(self.ann_file).with_suffix(".cache")
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache["hash"] == get_hash([self.ann_file])
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_labels(cache_path), False
+
+        nf, nm, ne, nc, n = cache.pop("results")
+        if exists and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)
+            if cache["msgs"]:
+                LOGGER.info("\n".join(cache["msgs"]))
+
+        [cache.pop(k) for k in ("hash", "version", "msgs")]
+        labels = cache["labels"]
+        if not labels:
+            raise RuntimeError(f"No valid images found in {cache_path}. {HELP_URL}")
+        self.im_files = [lb["im_file"] for lb in labels]
+        return labels
+
+
 class YOLOConcatDataset(ConcatDataset):
     """Dataset as a concatenation of multiple datasets.
 

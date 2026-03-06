@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLODatasetCOCO, YOLOMultiModalDataset
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -230,10 +230,14 @@ def build_yolo_dataset(
     rect: bool = False,
     stride: int = 32,
     multi_modal: bool = False,
+    ann_file: str | None = None,
 ) -> Dataset:
-    """Build and return a YOLO dataset based on configuration parameters."""
-    dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
-    return dataset(
+    """Build and return a YOLO dataset based on configuration parameters.
+
+    When ``ann_file`` is provided, a :class:`YOLODatasetCOCO` is returned, which loads labels
+    from a single COCO-format JSON file instead of per-image ``.txt`` files.
+    """
+    common_kwargs = dict(
         img_path=img_path,
         imgsz=cfg.imgsz,
         batch_size=batch,
@@ -250,6 +254,10 @@ def build_yolo_dataset(
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
     )
+    if ann_file:
+        return YOLODatasetCOCO(ann_file=ann_file, **common_kwargs)
+    dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    return dataset(**common_kwargs)
 
 
 def build_grounding(

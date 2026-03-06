@@ -298,7 +298,15 @@ class DetectionValidator(BaseValidator):
         Returns:
             (Dataset): YOLO dataset.
         """
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
+        # Auto-detect COCO annotation file: prefer an exact split match, then fall back to val_ann
+        ann_file = None
+        for split in ("train", "val", "test"):
+            if str(img_path) == str(self.data.get(split, "")):
+                ann_file = self.data.get(f"{split}_ann")
+                break
+        if ann_file is None:
+            ann_file = self.data.get("val_ann")
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride, ann_file=ann_file)
 
     def get_dataloader(self, dataset_path: str, batch_size: int) -> torch.utils.data.DataLoader:
         """Construct and return dataloader.
