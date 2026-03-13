@@ -34,6 +34,7 @@ from .converter import merge_multi_segment
 from .utils import (
     HELP_URL,
     check_file_speeds,
+    exif_size,
     get_hash,
     img2label_paths,
     load_dataset_cache_file,
@@ -731,13 +732,25 @@ class YOLODatasetCOCO(YOLODataset):
         for ann in coco_data["annotations"]:
             img_to_anns[ann["image_id"]].append(ann)
 
+        num_cls = len(self.data["names"])
         desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
         for img_id, img_info in TQDM(images.items(), desc=desc):
-            h, w = img_info["height"], img_info["width"]
             im_file = Path(self.img_path) / img_info["file_name"]
 
             if not im_file.exists():
                 nm += 1
+                continue
+
+            # Use EXIF-corrected image dimensions (same as verify_image_label).
+            # This ensures bbox normalization is consistent with how the image is
+            # actually displayed, regardless of stored JPEG orientation.
+            try:
+                im_pil = Image.open(im_file)
+                im_pil.verify()
+                w, h = exif_size(im_pil)  # returns (width, height)
+            except Exception as e:
+                nc += 1
+                msgs.append(f"{self.prefix}{im_file}: ignoring corrupt image: {e}")
                 continue
 
             self.im_files.append(str(im_file))
@@ -752,12 +765,19 @@ class YOLODatasetCOCO(YOLODataset):
                     continue
                 cls_idx = cat_id_to_cls[cat_id]
 
-                # COCO bbox format: [x_min, y_min, width, height] in pixels.
-                # Convert to normalized center-format xywh.
+                # COCO bbox: [x_min, y_min, width, height] in pixels.
+                # Convert to xyxy, clamp to [0, 1], then back to normalized xywh.
+                # This matches the behavior of verify_image_label which rejects
+                # out-of-bounds coordinates, except we clamp gracefully instead.
                 bx, by, bw, bh = ann["bbox"]
-                if bw <= 0 or bh <= 0:
+                x1 = max(0.0, bx / w)
+                y1 = max(0.0, by / h)
+                x2 = min(1.0, (bx + bw) / w)
+                y2 = min(1.0, (by + bh) / h)
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 0 or nh <= 0:
                     continue
-                bboxes.append([cls_idx, (bx + bw / 2) / w, (by + bh / 2) / h, bw / w, bh / h])
+                bboxes.append([cls_idx, (x1 + x2) / 2, (y1 + y2) / 2, nw, nh])
 
                 # Optionally load segmentation polygons for segment task
                 if self.use_segments and ann.get("segmentation"):
@@ -782,6 +802,26 @@ class YOLODatasetCOCO(YOLODataset):
                 cls_arr = np.array([s[0] for s in segs], dtype=np.float32)
                 segments_out = [np.array(s[1:], dtype=np.float32).reshape(-1, 2) for s in segs]
                 lb = np.concatenate((cls_arr.reshape(-1, 1), segments2boxes(segments_out)), axis=1)
+
+            # Deduplicate annotations (matches verify_image_label behaviour).
+            if len(lb):
+                # Also validate class indices are within dataset range.
+                valid = lb[:, 0] < num_cls
+                if not valid.all():
+                    msgs.append(
+                        f"{self.prefix}{im_file}: skipping {(~valid).sum()} annotations with out-of-range class index"
+                    )
+                    lb = lb[valid]
+                    if segments_out:
+                        segments_out = [s for s, v in zip(segments_out, valid) if v]
+
+                nl = len(lb)
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:
+                    msgs.append(f"{self.prefix}{im_file}: {nl - len(i)} duplicate annotations removed")
+                    lb = lb[i]
+                    if segments_out:
+                        segments_out = [segments_out[j] for j in sorted(i)]
 
             if len(lb):
                 nf += 1
