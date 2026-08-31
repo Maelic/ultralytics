@@ -12,6 +12,7 @@ import gc
 import math
 import os
 import subprocess
+import sys
 import time
 import warnings
 from copy import copy, deepcopy
@@ -478,16 +479,35 @@ class BaseTrainer:
                 # Log
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
-                        )
+                    _desc = ("%11s" * 2 + "%11.4g" * (2 + loss_length)) % (
+                        f"{epoch + 1}/{self.epochs}",
+                        f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                        *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                        batch["cls"].shape[0],  # batch size, i.e. 8
+                        batch["img"].shape[-1],  # imgsz, i.e 640
                     )
+                    pbar.set_description(_desc)
+                    # In non-interactive environments (SLURM, detached), log every N iterations
+                    if not sys.stdout.isatty():
+                        _log_interval = int(os.environ.get("YOLO_LOG_INTERVAL", 200))
+                        if i % _log_interval == 0:
+                            _elapsed = time.time() - self.train_time_start
+                            _total_iters = self.epochs * nb
+                            _done_iters = epoch * nb + i + 1
+                            _eta_secs = (_elapsed / _done_iters) * (_total_iters - _done_iters) if _done_iters > 0 else 0
+                            _eta_str = f"{int(_eta_secs // 3600)}h{int((_eta_secs % 3600) // 60):02d}m{int(_eta_secs % 60):02d}s"
+                            LOGGER.info(
+                                ("%11s" * 4 + "%11.4g" * (2 + loss_length))
+                                % (
+                                    f"{epoch + 1}/{self.epochs}",
+                                    f"{i}/{nb}",
+                                    f"{self._get_memory():.3g}G",
+                                    f"ETA:{_eta_str}",
+                                    *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
+                                    batch["cls"].shape[0],
+                                    batch["img"].shape[-1],
+                                )
+                            )
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
