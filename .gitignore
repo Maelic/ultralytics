@@ -203,3 +203,9 @@ calibration_*.npy
 # Training logs
 args.yaml
 results.csv
+
+# --- cluster hygiene (added 2026-08-31) ---
+# venv accidentally created inside the package dir ultralytics/
+ultralytics/bin/
+ultralytics/lib64
+ultralytics/pyvenv.cfg
